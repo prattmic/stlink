@@ -43,6 +43,8 @@ typedef struct _st_state_t {
     int listen_port;
     int persistent;
     int reset;
+    int client;
+    int attached;
 } st_state_t;
 
 
@@ -662,6 +664,550 @@ error:
     return error;
 }
 
+static char* gdb_extended_packet(stlink_t* sl __unused, st_state_t* st,
+                                 char* packet __unused, int len __unused) {
+    /*
+     * Enter extended mode which allows restarting.
+     * We do support that always.
+     */
+
+    /*
+     * Also, set to persistent mode
+     * to allow GDB disconnect.
+     */
+    st->persistent = 1;
+
+    return strdup("OK");
+}
+
+static char* gdb_halt_reason_packet(stlink_t* sl __unused, st_state_t* st,
+                                    char* packet __unused, int len __unused) {
+    if(st->attached) {
+        return strdup("S05"); // TRAP
+    } else {
+        /* Stub shall reply OK if not attached. */
+        return strdup("OK");
+    }
+}
+
+static char* gdb_continue_packet(stlink_t* sl, st_state_t* st,
+                                 char* packet __unused, int len __unused) {
+    stlink_run(sl);
+
+    while(1) {
+        int status = gdb_check_for_interrupt(st->client);
+        if(status < 0) {
+            ELOG("cannot check for int: %d\n", status);
+            return NULL;
+        }
+
+        if(status == 1) {
+            stlink_force_debug(sl);
+            break;
+        }
+
+        stlink_status(sl);
+        if(sl->core_stat == STLINK_CORE_HALTED) {
+            break;
+        }
+
+        usleep(100000);
+    }
+
+    return strdup("S05"); // TRAP
+}
+
+static char* gdb_read_general_regs_packet(stlink_t* sl,
+                                          st_state_t* st __unused,
+                                          char* packet __unused,
+                                          int len __unused) {
+    reg regp;
+    char *reply;
+
+    stlink_read_all_regs(sl, &regp);
+
+    reply = calloc(8 * 16 + 1, 1);
+    for(int i = 0; i < 16; i++)
+        sprintf(&reply[i * 8], "%08x", htonl(regp.r[i]));
+
+    return reply;
+}
+
+static char* gdb_write_general_regs_packet(stlink_t* sl,
+                                           st_state_t* st __unused,
+                                           char* packet,
+                                           int len __unused) {
+    for(int i = 0; i < 16; i++) {
+        char str[9] = {0};
+        strncpy(str, &packet[1 + i * 8], 8);
+        uint32_t reg = strtoul(str, NULL, 16);
+        stlink_write_reg(sl, ntohl(reg), i);
+    }
+
+    return strdup("OK");
+}
+
+static char* gdb_read_mem_packet(stlink_t* sl, st_state_t* st __unused,
+                                 char* packet, int len __unused) {
+    char *reply;
+    char* s_start = &packet[1];
+    char* s_count = strstr(&packet[1], ",") + 1;
+
+    stm32_addr_t start = strtoul(s_start, NULL, 16);
+    unsigned     count = strtoul(s_count, NULL, 16);
+
+    unsigned adj_start = start % 4;
+    unsigned count_rnd = (count + adj_start + 4 - 1) / 4 * 4;
+
+    stlink_read_mem32(sl, start - adj_start, count_rnd);
+
+    reply = calloc(count * 2 + 1, 1);
+    for(unsigned int i = 0; i < count; i++) {
+        reply[i * 2 + 0] = hex[sl->q_buf[i + adj_start] >> 4];
+        reply[i * 2 + 1] = hex[sl->q_buf[i + adj_start] & 0xf];
+    }
+
+    return reply;
+}
+
+static char* gdb_write_mem_packet(stlink_t* sl, st_state_t* st __unused,
+                                  char* packet, int len __unused) {
+    char* s_start = &packet[1];
+    char* s_count = strstr(&packet[1], ",") + 1;
+    char* hexdata = strstr(packet, ":") + 1;
+
+    stm32_addr_t start = strtoul(s_start, NULL, 16);
+    unsigned     count = strtoul(s_count, NULL, 16);
+
+    if(start % 4) {
+        unsigned align_count = 4 - start % 4;
+        if (align_count > count) align_count = count;
+        for(unsigned int i = 0; i < align_count; i ++) {
+            char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+            uint8_t byte = strtoul(hex, NULL, 16);
+            sl->q_buf[i] = byte;
+        }
+        stlink_write_mem8(sl, start, align_count);
+        start += align_count;
+        count -= align_count;
+        hexdata += 2*align_count;
+    }
+
+    if(count - count % 4) {
+        unsigned aligned_count = count - count % 4;
+
+        for(unsigned int i = 0; i < aligned_count; i ++) {
+            char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+            uint8_t byte = strtoul(hex, NULL, 16);
+            sl->q_buf[i] = byte;
+        }
+        stlink_write_mem32(sl, start, aligned_count);
+        count -= aligned_count;
+        start += aligned_count;
+        hexdata += 2*aligned_count;
+    }
+
+    if(count) {
+        for(unsigned int i = 0; i < count; i ++) {
+            char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
+            uint8_t byte = strtoul(hex, NULL, 16);
+            sl->q_buf[i] = byte;
+        }
+        stlink_write_mem8(sl, start, count);
+    }
+
+    return strdup("OK");
+}
+
+static char* gdb_read_reg_packet(stlink_t* sl, st_state_t* st __unused,
+                                 char* packet, int len __unused) {
+    char *reply;
+    reg regp;
+    unsigned regval;
+    unsigned id = strtoul(&packet[1], NULL, 16);
+
+    if(id < 16) {
+        stlink_read_reg(sl, id, &regp);
+        regval = htonl(regp.r[id]);
+    } else if(id == 0x19) {
+        stlink_read_reg(sl, 16, &regp);
+        regval = htonl(regp.xpsr);
+    } else if(id == 0x1A) {
+        stlink_read_reg(sl, 17, &regp);
+        regval = htonl(regp.main_sp);
+    } else if(id == 0x1B) {
+        stlink_read_reg(sl, 18, &regp);
+        regval = htonl(regp.process_sp);
+    } else if(id == 0x1C) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.control);
+    } else if(id == 0x1D) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.faultmask);
+    } else if(id == 0x1E) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.basepri);
+    } else if(id == 0x1F) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.primask);
+    } else if(id >= 0x20 && id < 0x40) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.s[id-0x20]);
+    } else if(id == 0x40) {
+        stlink_read_unsupported_reg(sl, id, &regp);
+        regval = htonl(regp.fpscr);
+    } else {
+        return strdup("E00");
+    }
+
+    reply = calloc(8 + 1, 1);
+    sprintf(reply, "%08x", regval);
+
+    return reply;
+}
+
+static char* gdb_write_reg_packet(stlink_t* sl, st_state_t* st __unused,
+                                 char* packet, int len __unused) {
+    reg regp;
+    char* s_reg = &packet[1];
+    char* s_value = strstr(&packet[1], "=") + 1;
+
+    unsigned reg   = strtoul(s_reg,   NULL, 16);
+    unsigned value = strtoul(s_value, NULL, 16);
+
+    if(reg < 16) {
+        stlink_write_reg(sl, ntohl(value), reg);
+    } else if(reg == 0x19) {
+        stlink_write_reg(sl, ntohl(value), 16);
+    } else if(reg == 0x1A) {
+        stlink_write_reg(sl, ntohl(value), 17);
+    } else if(reg == 0x1B) {
+        stlink_write_reg(sl, ntohl(value), 18);
+    } else if(reg == 0x1C) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else if(reg == 0x1D) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else if(reg == 0x1E) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else if(reg == 0x1F) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else if(reg >= 0x20 && reg < 0x40) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else if(reg == 0x40) {
+        stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
+    } else {
+        return strdup("E00");
+    }
+
+    return strdup("OK");
+}
+
+static char* gdb_query_packet(stlink_t* sl, st_state_t* st __unused,
+                              char* packet, int len __unused) {
+    char *reply = NULL;
+
+    if(packet[1] == 'P' || packet[1] == 'C' || packet[1] == 'L') {
+        return strdup("");
+    }
+
+    char *separator = strstr(packet, ":"), *params = "";
+    if(separator == NULL) {
+        separator = packet + strlen(packet);
+    } else {
+        params = separator + 1;
+    }
+
+    unsigned queryNameLength = (separator - &packet[1]);
+    char* queryName = calloc(queryNameLength + 1, 1);
+    strncpy(queryName, &packet[1], queryNameLength);
+
+    DLOG("query: %s;%s\n", queryName, params);
+
+    if(!strcmp(queryName, "Supported")) {
+        if(sl->chip_id==STM32_CHIPID_F4) {
+            reply = strdup("PacketSize=3fff;qXfer:memory-map:read+;qXfer:features:read+");
+        }
+        else {
+            reply = strdup("PacketSize=3fff;qXfer:memory-map:read+");
+        }
+    } else if(!strcmp(queryName, "Xfer")) {
+        char *type, *op, *__s_addr, *s_length;
+        char *tok = params;
+        char *annex __attribute__((unused));
+
+        type     = strsep(&tok, ":");
+        op       = strsep(&tok, ":");
+        annex    = strsep(&tok, ":");
+        __s_addr   = strsep(&tok, ",");
+        s_length = tok;
+
+        unsigned addr = strtoul(__s_addr, NULL, 16),
+                 length = strtoul(s_length, NULL, 16);
+
+        DLOG("Xfer: type:%s;op:%s;annex:%s;addr:%d;length:%d\n",
+                    type, op, annex, addr, length);
+
+        const char* data = NULL;
+
+        if(!strcmp(type, "memory-map") && !strcmp(op, "read"))
+            data = current_memory_map;
+
+        if(!strcmp(type, "features") && !strcmp(op, "read"))
+            data = target_description_F4;
+
+        if(data) {
+            unsigned data_length = strlen(data);
+            if(addr + length > data_length)
+                length = data_length - addr;
+
+            if(length == 0) {
+                reply = strdup("l");
+            } else {
+                reply = calloc(length + 2, 1);
+                reply[0] = 'm';
+                strncpy(&reply[1], data, length);
+            }
+        }
+    } else if(!strncmp(queryName, "Rcmd,",4)) {
+        // Rcmd uses the wrong separator
+        char *separator = strstr(packet, ","), *params = "";
+        if(separator == NULL) {
+            separator = packet + strlen(packet);
+        } else {
+            params = separator + 1;
+        }
+
+
+        if (!strncmp(params,"726573756d65",12)) {// resume
+            DLOG("Rcmd: resume\n");
+            stlink_run(sl);
+
+            reply = strdup("OK");
+        } else if (!strncmp(params,"68616c74",8)) { //halt
+            reply = strdup("OK");
+
+            stlink_force_debug(sl);
+
+            DLOG("Rcmd: halt\n");
+        } else if (!strncmp(params,"6a7461675f7265736574",20)) { //jtag_reset
+            reply = strdup("OK");
+
+            stlink_jtag_reset(sl, 1);
+            stlink_jtag_reset(sl, 0);
+            stlink_force_debug(sl);
+
+            DLOG("Rcmd: jtag_reset\n");
+        } else if (!strncmp(params,"7265736574",10)) { //reset
+            reply = strdup("OK");
+
+            stlink_force_debug(sl);
+            stlink_reset(sl);
+            init_code_breakpoints(sl);
+            init_data_watchpoints(sl);
+
+            DLOG("Rcmd: reset\n");
+        } else {
+            DLOG("Rcmd: %s\n", params);
+        }
+
+    }
+
+    if(reply == NULL)
+        reply = strdup("");
+
+    free(queryName);
+
+    return reply;
+}
+
+static char* gdb_restart_packet(stlink_t* sl, st_state_t* st,
+                                char* packet __unused, int len __unused) {
+    stlink_reset(sl);
+    init_code_breakpoints(sl);
+    init_data_watchpoints(sl);
+
+    st->attached = 1;
+
+    return strdup("OK");
+}
+
+static char* gdb_step_packet(stlink_t* sl, st_state_t* st __unused,
+                             char* packet __unused, int len __unused) {
+    stlink_step(sl);
+
+    return strdup("S05"); // TRAP
+}
+
+static char* gdb_multiletter_packet(stlink_t* sl, st_state_t* st,
+                                    char* packet, int len) {
+    char *reply = NULL;
+    char *params = NULL;
+    char *cmdName = strtok_r(packet, ":;", &params);
+
+    cmdName++; // vCommand -> Command
+
+    if(!strcmp(cmdName, "FlashErase")) {
+        char *__s_addr, *s_length;
+        char *tok = params;
+
+        __s_addr   = strsep(&tok, ",");
+        s_length = tok;
+
+        unsigned addr = strtoul(__s_addr, NULL, 16),
+                 length = strtoul(s_length, NULL, 16);
+
+        DLOG("FlashErase: addr:%08x,len:%04x\n",
+                    addr, length);
+
+        if(flash_add_block(addr, length, sl) < 0) {
+            reply = strdup("E00");
+        } else {
+            reply = strdup("OK");
+        }
+    } else if(!strcmp(cmdName, "FlashWrite")) {
+        char *__s_addr, *data;
+        char *tok = params;
+
+        __s_addr = strsep(&tok, ":");
+        data   = tok;
+
+        unsigned addr = strtoul(__s_addr, NULL, 16);
+        unsigned data_length = len - (data - packet);
+
+        // Length of decoded data cannot be more than
+        // encoded, as escapes are removed.
+        // Additional byte is reserved for alignment fix.
+        uint8_t *decoded = calloc(data_length + 1, 1);
+        unsigned dec_index = 0;
+        for(unsigned int i = 0; i < data_length; i++) {
+            if(data[i] == 0x7d) {
+                i++;
+                decoded[dec_index++] = data[i] ^ 0x20;
+            } else {
+                decoded[dec_index++] = data[i];
+            }
+        }
+
+        // Fix alignment
+        if(dec_index % 2 != 0)
+            dec_index++;
+
+        DLOG("binary packet %d -> %d\n", data_length, dec_index);
+
+        if(flash_populate(addr, decoded, dec_index) < 0) {
+            reply = strdup("E00");
+        } else {
+            reply = strdup("OK");
+        }
+    } else if(!strcmp(cmdName, "FlashDone")) {
+        if(flash_go(sl) < 0) {
+            reply = strdup("E00");
+        } else {
+            reply = strdup("OK");
+        }
+    } else if(!strcmp(cmdName, "Kill")) {
+        st->attached = 0;
+
+        reply = strdup("OK");
+    }
+
+    if(reply == NULL)
+        reply = strdup("");
+
+    return reply;
+}
+
+static char* gdb_remove_breakpoint_packet(stlink_t* sl,
+                                          st_state_t* st __unused,
+                                          char* packet,
+                                          int len __unused) {
+    char *endptr;
+    stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
+
+    switch (packet[1]) {
+        case '1': // remove breakpoint
+            update_code_breakpoint(sl, addr, 0);
+            return strdup("OK");
+            break;
+
+        case '2' : // remove write watchpoint
+        case '3' : // remove read watchpoint
+        case '4' : // remove access watchpoint
+            if(delete_data_watchpoint(sl, addr) < 0) {
+                return strdup("E00");
+            } else {
+                return strdup("OK");
+            }
+
+        default:
+            return strdup("");
+    }
+}
+
+static char* gdb_insert_breakpoint_packet(stlink_t* sl,
+                                          st_state_t* st __unused,
+                                          char* packet,
+                                          int len __unused) {
+    char *endptr;
+    stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
+    stm32_addr_t watchlen = strtoul(&endptr[1], NULL, 16);
+
+    switch (packet[1]) {
+        case '1':
+            if(update_code_breakpoint(sl, addr, 1) < 0) {
+                return strdup("E00");
+            } else {
+                return strdup("OK");
+            }
+            break;
+
+        case '2':   // insert write watchpoint
+        case '3':   // insert read  watchpoint
+        case '4': { // insert access watchpoint
+            enum watchfun wf;
+            if(packet[1] == '2') {
+                wf = WATCHWRITE;
+            } else if(packet[1] == '3') {
+                wf = WATCHREAD;
+            } else {
+                wf = WATCHACCESS;
+            }
+
+            if(add_data_watchpoint(sl, wf, addr, watchlen) < 0) {
+                return strdup("E00");
+            } else {
+                return strdup("OK");
+            }
+        }
+
+        default:
+            return strdup("");
+    }
+}
+
+/*
+ * Each handler returns a dynamically allocated char * which will be
+ * sent to GDB as the packet reply, then freed.  NULL indicates an
+ * error that requires program exit.
+ */
+static char* (*packet_handler[NUM_PACKETS])(stlink_t*, st_state_t*, char*, int) = {
+    ['!'] = gdb_extended_packet,
+    ['?'] = gdb_halt_reason_packet,
+    ['c'] = gdb_continue_packet,
+    ['g'] = gdb_read_general_regs_packet,
+    ['G'] = gdb_write_general_regs_packet,
+    ['m'] = gdb_read_mem_packet,
+    ['M'] = gdb_write_mem_packet,
+    ['p'] = gdb_read_reg_packet,
+    ['P'] = gdb_write_reg_packet,
+    ['q'] = gdb_query_packet,
+    ['R'] = gdb_restart_packet,
+    ['s'] = gdb_step_packet,
+    ['v'] = gdb_multiletter_packet,
+    ['z'] = gdb_remove_breakpoint_packet,
+    ['Z'] = gdb_insert_breakpoint_packet,
+};
+
 int gdb_connect(st_state_t *st) {
     int sock, client = -1;
     unsigned int optval;
@@ -712,8 +1258,8 @@ err:
 }
 
 int serve(stlink_t *sl, st_state_t *st) {
-    int client = gdb_connect(st);
-    if (client < 0) {
+    st->client = gdb_connect(st);
+    if (st->client < 0) {
         return -1;
     }
 
@@ -730,543 +1276,44 @@ int serve(stlink_t *sl, st_state_t *st) {
      * To allow resetting the chip from GDB it is required to
      * emulate attaching and detaching to target.
      */
-    unsigned int attached = 1;
+    st->attached = 1;
 
     while(!signal_exit) {
         char* packet;
+        char* reply = NULL;
+        char* (*handler)(stlink_t*, st_state_t*, char*, int);
 
-        int status = gdb_recv_packet(client, &packet);
-        if(status < 0) {
-            ELOG("cannot recv: %d\n", status);
-            return 1;
+        int len = gdb_recv_packet(st->client, &packet);
+        if (len < 0) {
+            ELOG("cannot recv: %d\n", len);
+            return -1;
         }
 
         DLOG("recv: %s\n", packet);
 
-        char* reply = NULL;
-        reg regp;
-
-        switch(packet[0]) {
-            case 'q': {
-                if(packet[1] == 'P' || packet[1] == 'C' || packet[1] == 'L') {
-                    reply = strdup("");
-                    break;
-                }
-
-                char *separator = strstr(packet, ":"), *params = "";
-                if(separator == NULL) {
-                    separator = packet + strlen(packet);
-                } else {
-                    params = separator + 1;
-                }
-
-                unsigned queryNameLength = (separator - &packet[1]);
-                char* queryName = calloc(queryNameLength + 1, 1);
-                strncpy(queryName, &packet[1], queryNameLength);
-
-                DLOG("query: %s;%s\n", queryName, params);
-
-                if(!strcmp(queryName, "Supported")) {
-                    if(sl->chip_id==STM32_CHIPID_F4) {
-                        reply = strdup("PacketSize=3fff;qXfer:memory-map:read+;qXfer:features:read+");
-                    }
-                    else {
-                        reply = strdup("PacketSize=3fff;qXfer:memory-map:read+");
-                    }
-                } else if(!strcmp(queryName, "Xfer")) {
-                    char *type, *op, *__s_addr, *s_length;
-                    char *tok = params;
-                    char *annex __attribute__((unused));
-
-                    type     = strsep(&tok, ":");
-                    op       = strsep(&tok, ":");
-                    annex    = strsep(&tok, ":");
-                    __s_addr   = strsep(&tok, ",");
-                    s_length = tok;
-
-                    unsigned addr = strtoul(__s_addr, NULL, 16),
-                             length = strtoul(s_length, NULL, 16);
-
-                    DLOG("Xfer: type:%s;op:%s;annex:%s;addr:%d;length:%d\n",
-                                type, op, annex, addr, length);
-
-                    const char* data = NULL;
-
-                    if(!strcmp(type, "memory-map") && !strcmp(op, "read"))
-                        data = current_memory_map;
-
-                    if(!strcmp(type, "features") && !strcmp(op, "read"))
-                        data = target_description_F4;
-
-                    if(data) {
-                        unsigned data_length = strlen(data);
-                        if(addr + length > data_length)
-                            length = data_length - addr;
-
-                        if(length == 0) {
-                            reply = strdup("l");
-                        } else {
-                            reply = calloc(length + 2, 1);
-                            reply[0] = 'm';
-                            strncpy(&reply[1], data, length);
-                        }
-                    }
-                } else if(!strncmp(queryName, "Rcmd,",4)) {
-                    // Rcmd uses the wrong separator
-                    char *separator = strstr(packet, ","), *params = "";
-                    if(separator == NULL) {
-                        separator = packet + strlen(packet);
-                    } else {
-                        params = separator + 1;
-                    }
-
-
-                    if (!strncmp(params,"726573756d65",12)) {// resume
-                        DLOG("Rcmd: resume\n");
-                        stlink_run(sl);
-
-                        reply = strdup("OK");
-                    } else if (!strncmp(params,"68616c74",8)) { //halt
-                        reply = strdup("OK");
-
-                        stlink_force_debug(sl);
-
-                        DLOG("Rcmd: halt\n");
-                    } else if (!strncmp(params,"6a7461675f7265736574",20)) { //jtag_reset
-                        reply = strdup("OK");
-
-                        stlink_jtag_reset(sl, 1);
-                        stlink_jtag_reset(sl, 0);
-                        stlink_force_debug(sl);
-
-                        DLOG("Rcmd: jtag_reset\n");
-                    } else if (!strncmp(params,"7265736574",10)) { //reset
-                        reply = strdup("OK");
-
-                        stlink_force_debug(sl);
-                        stlink_reset(sl);
-                        init_code_breakpoints(sl);
-                        init_data_watchpoints(sl);
-
-                        DLOG("Rcmd: reset\n");
-                    } else {
-                        DLOG("Rcmd: %s\n", params);
-                    }
-
-                }
-
-                if(reply == NULL)
-                    reply = strdup("");
-
-                free(queryName);
-
-                break;
-            }
-
-            case 'v': {
-                char *params = NULL;
-                char *cmdName = strtok_r(packet, ":;", &params);
-
-                cmdName++; // vCommand -> Command
-
-                if(!strcmp(cmdName, "FlashErase")) {
-                    char *__s_addr, *s_length;
-                    char *tok = params;
-
-                    __s_addr   = strsep(&tok, ",");
-                    s_length = tok;
-
-                    unsigned addr = strtoul(__s_addr, NULL, 16),
-                             length = strtoul(s_length, NULL, 16);
-
-                    DLOG("FlashErase: addr:%08x,len:%04x\n",
-                                addr, length);
-
-                    if(flash_add_block(addr, length, sl) < 0) {
-                        reply = strdup("E00");
-                    } else {
-                        reply = strdup("OK");
-                    }
-                } else if(!strcmp(cmdName, "FlashWrite")) {
-                    char *__s_addr, *data;
-                    char *tok = params;
-
-                    __s_addr = strsep(&tok, ":");
-                    data   = tok;
-
-                    unsigned addr = strtoul(__s_addr, NULL, 16);
-                    unsigned data_length = status - (data - packet);
-
-                    // Length of decoded data cannot be more than
-                    // encoded, as escapes are removed.
-                    // Additional byte is reserved for alignment fix.
-                    uint8_t *decoded = calloc(data_length + 1, 1);
-                    unsigned dec_index = 0;
-                    for(unsigned int i = 0; i < data_length; i++) {
-                        if(data[i] == 0x7d) {
-                            i++;
-                            decoded[dec_index++] = data[i] ^ 0x20;
-                        } else {
-                            decoded[dec_index++] = data[i];
-                        }
-                    }
-
-                    // Fix alignment
-                    if(dec_index % 2 != 0)
-                        dec_index++;
-
-                    DLOG("binary packet %d -> %d\n", data_length, dec_index);
-
-                    if(flash_populate(addr, decoded, dec_index) < 0) {
-                        reply = strdup("E00");
-                    } else {
-                        reply = strdup("OK");
-                    }
-                } else if(!strcmp(cmdName, "FlashDone")) {
-                    if(flash_go(sl) < 0) {
-                        reply = strdup("E00");
-                    } else {
-                        reply = strdup("OK");
-                    }
-                } else if(!strcmp(cmdName, "Kill")) {
-                    attached = 0;
-
-                    reply = strdup("OK");
-                }
-
-                if(reply == NULL)
-                    reply = strdup("");
-
-                break;
-            }
-
-            case 'c':
-                stlink_run(sl);
-
-                while(1) {
-                    int status = gdb_check_for_interrupt(client);
-                    if(status < 0) {
-                        ELOG("cannot check for int: %d\n", status);
-                        return 1;
-                    }
-
-                    if(status == 1) {
-                        stlink_force_debug(sl);
-                        break;
-                    }
-
-                    stlink_status(sl);
-                    if(sl->core_stat == STLINK_CORE_HALTED) {
-                        break;
-                    }
-
-                    usleep(100000);
-                }
-
-                reply = strdup("S05"); // TRAP
-                break;
-
-            case 's':
-                stlink_step(sl);
-
-                reply = strdup("S05"); // TRAP
-                break;
-
-            case '?':
-                if(attached) {
-                    reply = strdup("S05"); // TRAP
-                } else {
-                    /* Stub shall reply OK if not attached. */
-                    reply = strdup("OK");
-                }
-                break;
-
-            case 'g':
-                stlink_read_all_regs(sl, &regp);
-
-                reply = calloc(8 * 16 + 1, 1);
-                for(int i = 0; i < 16; i++)
-                    sprintf(&reply[i * 8], "%08x", htonl(regp.r[i]));
-
-                break;
-
-            case 'p': {
-                unsigned id = strtoul(&packet[1], NULL, 16);
-                unsigned myreg = 0xDEADDEAD;
-
-                if(id < 16) {
-                    stlink_read_reg(sl, id, &regp);
-                    myreg = htonl(regp.r[id]);
-                } else if(id == 0x19) {
-                    stlink_read_reg(sl, 16, &regp);
-                    myreg = htonl(regp.xpsr);
-                } else if(id == 0x1A) {
-                    stlink_read_reg(sl, 17, &regp);
-                    myreg = htonl(regp.main_sp);
-                } else if(id == 0x1B) {
-                    stlink_read_reg(sl, 18, &regp);
-                    myreg = htonl(regp.process_sp);
-                } else if(id == 0x1C) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.control);
-                } else if(id == 0x1D) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.faultmask);
-                } else if(id == 0x1E) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.basepri);
-                } else if(id == 0x1F) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.primask);
-                } else if(id >= 0x20 && id < 0x40) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.s[id-0x20]);
-                } else if(id == 0x40) {
-                    stlink_read_unsupported_reg(sl, id, &regp);
-                    myreg = htonl(regp.fpscr);
-                } else {
-                    reply = strdup("E00");
-                }
-
-                reply = calloc(8 + 1, 1);
-                sprintf(reply, "%08x", myreg);
-
-                break;
-            }
-
-            case 'P': {
-                char* s_reg = &packet[1];
-                char* s_value = strstr(&packet[1], "=") + 1;
-
-                unsigned reg   = strtoul(s_reg,   NULL, 16);
-                unsigned value = strtoul(s_value, NULL, 16);
-
-                if(reg < 16) {
-                    stlink_write_reg(sl, ntohl(value), reg);
-                } else if(reg == 0x19) {
-                    stlink_write_reg(sl, ntohl(value), 16);
-                } else if(reg == 0x1A) {
-                    stlink_write_reg(sl, ntohl(value), 17);
-                } else if(reg == 0x1B) {
-                    stlink_write_reg(sl, ntohl(value), 18);
-                } else if(reg == 0x1C) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else if(reg == 0x1D) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else if(reg == 0x1E) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else if(reg == 0x1F) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else if(reg >= 0x20 && reg < 0x40) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else if(reg == 0x40) {
-                    stlink_write_unsupported_reg(sl, ntohl(value), reg, &regp);
-                } else {
-                    reply = strdup("E00");
-                }
-
-                if(!reply) {
-                    reply = strdup("OK");
-                }
-
-                break;
-            }
-
-            case 'G':
-                for(int i = 0; i < 16; i++) {
-                    char str[9] = {0};
-                    strncpy(str, &packet[1 + i * 8], 8);
-                    uint32_t reg = strtoul(str, NULL, 16);
-                    stlink_write_reg(sl, ntohl(reg), i);
-                }
-
-                reply = strdup("OK");
-                break;
-
-            case 'm': {
-                char* s_start = &packet[1];
-                char* s_count = strstr(&packet[1], ",") + 1;
-
-                stm32_addr_t start = strtoul(s_start, NULL, 16);
-                unsigned     count = strtoul(s_count, NULL, 16);
-
-                unsigned adj_start = start % 4;
-                unsigned count_rnd = (count + adj_start + 4 - 1) / 4 * 4;
-
-                stlink_read_mem32(sl, start - adj_start, count_rnd);
-
-                reply = calloc(count * 2 + 1, 1);
-                for(unsigned int i = 0; i < count; i++) {
-                    reply[i * 2 + 0] = hex[sl->q_buf[i + adj_start] >> 4];
-                    reply[i * 2 + 1] = hex[sl->q_buf[i + adj_start] & 0xf];
-                }
-
-                break;
-            }
-
-            case 'M': {
-                char* s_start = &packet[1];
-                char* s_count = strstr(&packet[1], ",") + 1;
-                char* hexdata = strstr(packet, ":") + 1;
-
-                stm32_addr_t start = strtoul(s_start, NULL, 16);
-                unsigned     count = strtoul(s_count, NULL, 16);
-
-                if(start % 4) {
-                    unsigned align_count = 4 - start % 4;
-                    if (align_count > count) align_count = count;
-                    for(unsigned int i = 0; i < align_count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
-                        sl->q_buf[i] = byte;
-                    }
-                    stlink_write_mem8(sl, start, align_count);
-                    start += align_count;
-                    count -= align_count;
-                    hexdata += 2*align_count;
-                }
-
-                if(count - count % 4) {
-                    unsigned aligned_count = count - count % 4;
-
-                    for(unsigned int i = 0; i < aligned_count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
-                        sl->q_buf[i] = byte;
-                    }
-                    stlink_write_mem32(sl, start, aligned_count);
-                    count -= aligned_count;
-                    start += aligned_count;
-                    hexdata += 2*aligned_count;
-                }
-
-                if(count) {
-                    for(unsigned int i = 0; i < count; i ++) {
-                        char hex[3] = { hexdata[i*2], hexdata[i*2+1], 0 };
-                        uint8_t byte = strtoul(hex, NULL, 16);
-                        sl->q_buf[i] = byte;
-                    }
-                    stlink_write_mem8(sl, start, count);
-                }
-                reply = strdup("OK");
-                break;
-            }
-
-            case 'Z': {
-                char *endptr;
-                stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
-                stm32_addr_t len  = strtoul(&endptr[1], NULL, 16);
-
-                switch (packet[1]) {
-                    case '1':
-                        if(update_code_breakpoint(sl, addr, 1) < 0) {
-                            reply = strdup("E00");
-                        } else {
-                            reply = strdup("OK");
-                        }
-                        break;
-
-                    case '2':   // insert write watchpoint
-                    case '3':   // insert read  watchpoint
-                    case '4': { // insert access watchpoint
-                        enum watchfun wf;
-                        if(packet[1] == '2') {
-                            wf = WATCHWRITE;
-                        } else if(packet[1] == '3') {
-                            wf = WATCHREAD;
-                        } else {
-                            wf = WATCHACCESS;
-                        }
-
-                        if(add_data_watchpoint(sl, wf, addr, len) < 0) {
-                            reply = strdup("E00");
-                        } else {
-                            reply = strdup("OK");
-                            break;
-                        }
-                    }
-
-                    default:
-                        reply = strdup("");
-                }
-                break;
-            }
-            case 'z': {
-                char *endptr;
-                stm32_addr_t addr = strtoul(&packet[3], &endptr, 16);
-                //stm32_addr_t len  = strtoul(&endptr[1], NULL, 16);
-
-                switch (packet[1]) {
-                    case '1': // remove breakpoint
-                        update_code_breakpoint(sl, addr, 0);
-                        reply = strdup("OK");
-                        break;
-
-                    case '2' : // remove write watchpoint
-                    case '3' : // remove read watchpoint
-                    case '4' : // remove access watchpoint
-                        if(delete_data_watchpoint(sl, addr) < 0) {
-                            reply = strdup("E00");
-                        } else {
-                            reply = strdup("OK");
-                            break;
-                        }
-
-                    default:
-                        reply = strdup("");
-                }
-                break;
-            }
-
-            case '!': {
-                /*
-                 * Enter extended mode which allows restarting.
-                 * We do support that always.
-                 */
-
-                /*
-                 * Also, set to persistent mode
-                 * to allow GDB disconnect.
-                 */
-                st->persistent = 1;
-
-                reply = strdup("OK");
-
-                break;
-            }
-
-            case 'R': {
-                /* Reset the core. */
-
-                stlink_reset(sl);
-                init_code_breakpoints(sl);
-                init_data_watchpoints(sl);
-
-                attached = 1;
-
-                reply = strdup("OK");
-
-                break;
-            }
-
-            default:
-                reply = strdup("");
-        }
-
-        if(reply) {
-            DLOG("send: %s\n", reply);
-
-            int result = gdb_send_packet(client, reply);
-            if(result != 0) {
-                ELOG("cannot send: %d\n", result);
-                free(reply);
+        handler = packet_handler[(unsigned int)packet[0]];
+
+        if (handler) {
+            reply = handler(sl, st, packet, len);
+            if (!reply) {
                 free(packet);
-                return 1;
+                return -1;
             }
-
-            free(reply);
+        } else {
+            reply = strdup("");
         }
 
+        DLOG("send: %s\n", reply);
+
+        int result = gdb_send_packet(st->client, reply);
+        if (result != 0) {
+            ELOG("cannot send: %d\n", result);
+            free(reply);
+            free(packet);
+            return -1;
+        }
+
+        free(reply);
         free(packet);
     }
 

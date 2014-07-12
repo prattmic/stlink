@@ -1,6 +1,8 @@
 #ifndef _GDB_SERVER_H
 #define _GDB_SERVER_H
 
+#define __unused    __attribute__((unused))
+
 #define STRINGIFY_inner(name) #name
 #define STRINGIFY(name) STRINGIFY_inner(name)
 
