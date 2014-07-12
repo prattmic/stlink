@@ -4,6 +4,7 @@
  * license that can be found in the LICENSE file.
  */
 
+#include <errno.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
@@ -31,8 +32,6 @@
 //Allways update the FLASH_PAGE before each use, by calling stlink_calculate_pagesize
 #define FLASH_PAGE (sl->flash_pgsz)
 
-stlink_t *connected_stlink = NULL;
-
 static const char hex[] = "0123456789abcdef";
 
 static const char* current_memory_map = NULL;
@@ -50,15 +49,17 @@ typedef struct _st_state_t {
 int serve(stlink_t *sl, st_state_t *st);
 char* make_memory_map(stlink_t *sl);
 
-static void cleanup(int signal __attribute__((unused))) {
-    if (connected_stlink) {
-        /* Switch back to mass storage mode before closing. */
-        stlink_run(connected_stlink);
-        stlink_exit_debug_mode(connected_stlink);
-        stlink_close(connected_stlink);
-    }
+volatile sig_atomic_t signal_exit = 0;
 
-    exit(1);
+static void signal_handler(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+
+    signal_exit = 1;
+
+    /* Unregister handler so that a second delivery will force an exit */
+    sigaction(signum, &sa, NULL);
 }
 
 
@@ -160,6 +161,7 @@ int parse_options(int argc, char** argv, st_state_t *st) {
 
 int main(int argc, char** argv) {
     int32_t voltage;
+    struct sigaction sa;
 
     stlink_t *sl = NULL;
 
@@ -182,9 +184,16 @@ int main(int argc, char** argv) {
             break;
     }
 
-    connected_stlink = sl;
-    signal(SIGINT, &cleanup);
-    signal(SIGTERM, &cleanup);
+    /*
+     * sigaction without SA_RESTART flag will force syscalls to
+     * return -EINTR when interrupted by a signal, instead of being
+     * restarted.  This allows us to properly exit upon signal
+     * delivery.
+     */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     if (state.reset) {
         stlink_reset(sl);
@@ -213,7 +222,11 @@ int main(int argc, char** argv) {
 
         /* Continue */
         stlink_run(sl);
-    } while (state.persistent);
+    } while (state.persistent && !signal_exit);
+
+    if (signal_exit) {
+        ILOG("Exit requested by signal\n");
+    }
 
 #ifdef __MINGW32__
 winsock_error:
@@ -649,42 +662,60 @@ error:
     return error;
 }
 
-int serve(stlink_t *sl, st_state_t *st) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if(sock < 0) {
-        perror("socket");
-        return 1;
+int gdb_connect(st_state_t *st) {
+    int sock, client = -1;
+    unsigned int optval;
+    struct sockaddr_in serv_addr = { 0 };
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        ELOG("Failed to create socket: %d\n", errno);
+        return -1;
     }
 
-    unsigned int val = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&val, sizeof(val));
+    /* Enable SO_REUSEADDR */
+    optval = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval))) {
+        ELOG("Failed to set socket options: %d\n", errno);
+        goto err;
+    }
 
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr,0,sizeof(struct sockaddr_in));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     serv_addr.sin_port = htons(st->listen_port);
 
-    if(bind(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        perror("bind");
-        return 1;
+    if (bind(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        ELOG("Failed to bind socket: %d\n", errno);
+        goto err;
     }
 
-    if(listen(sock, 5) < 0) {
-        perror("listen");
-        return 1;
+    if (listen(sock, 5) < 0) {
+        ELOG("Failed to listen on socket: %d\n", errno);
+        goto err;
     }
 
     ILOG("Listening at *:%d...\n", st->listen_port);
 
-    int client = accept(sock, NULL, NULL);
-    //signal (SIGINT, SIG_DFL);
-    if(client < 0) {
-        perror("accept");
-        return 1;
+    client = accept(sock, NULL, NULL);
+    if (client < 0) {
+        ELOG("Failed to accept connection on socket: %d\n", errno);
+        goto err;
     }
 
     close(sock);
+
+    return client;
+
+err:
+    close(sock);
+    return -1;
+}
+
+int serve(stlink_t *sl, st_state_t *st) {
+    int client = gdb_connect(st);
+    if (client < 0) {
+        return -1;
+    }
 
     stlink_force_debug(sl);
     if (st->reset) {
@@ -701,7 +732,7 @@ int serve(stlink_t *sl, st_state_t *st) {
      */
     unsigned int attached = 1;
 
-    while(1) {
+    while(!signal_exit) {
         char* packet;
 
         int status = gdb_recv_packet(client, &packet);
